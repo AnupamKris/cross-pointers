@@ -1,5 +1,6 @@
 import asyncio
 import json
+import contextlib
 import sys
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
@@ -80,6 +81,8 @@ class MouseServer:
         self._server: Optional[websockets.server.Serve] = None
         self._udp_clients: Set[Tuple[str, int]] = set()
         self._udp_transport: Optional[asyncio.DatagramTransport] = None
+        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self._pump_task: Optional[asyncio.Task] = None
 
     @property
     def address(self) -> str:
@@ -110,6 +113,7 @@ class MouseServer:
         self._udp_transport, _ = await self.loop.create_datagram_endpoint(
             lambda: asyncio.DatagramProtocol(), local_addr=(self._host, 0)
         )
+        self._pump_task = self.loop.create_task(self._pump())
 
     async def stop(self) -> None:
         if self._server:
@@ -121,25 +125,52 @@ class MouseServer:
         self._udp_transport = None
         self._udp_clients.clear()
         self._clients.clear()
+        if self._pump_task:
+            self._pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._pump_task
+        self._pump_task = None
 
-    async def broadcast(self, payload: str) -> None:
-        if self._clients:
-            stale = []
-            for client in tuple(self._clients):
-                try:
-                    await client.send(payload)
-                except Exception:
-                    stale.append(client)
-            for client in stale:
-                self._clients.discard(client)
+    async def _pump(self) -> None:
+        while True:
+            payload = await self._queue.get()
+            try:
+                if self._clients:
+                    stale = []
+                    for client in tuple(self._clients):
+                        try:
+                            await client.send(payload)
+                        except Exception:
+                            stale.append(client)
+                    for client in stale:
+                        self._clients.discard(client)
 
-        if self._udp_transport and self._udp_clients:
-            data = payload.encode()
-            for addr in tuple(self._udp_clients):
-                try:
-                    self._udp_transport.sendto(data, addr)
-                except Exception:
-                    self._udp_clients.discard(addr)
+                if self._udp_transport and self._udp_clients:
+                    data = payload.encode()
+                    for addr in tuple(self._udp_clients):
+                        try:
+                            self._udp_transport.sendto(data, addr)
+                        except Exception:
+                            self._udp_clients.discard(addr)
+            finally:
+                self._queue.task_done()
+
+    def enqueue(self, payload: str) -> None:
+        """Queue events with light backpressure; drop oldest moves if saturated."""
+        if self._queue.full():
+            # Drop the oldest move event to prioritize clicks.
+            try:
+                oldest = self._queue.get_nowait()
+                if '"action": "move"' not in oldest:
+                    # put it back if it was not a move
+                    self._queue.put_nowait(oldest)
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            # If still full, drop the new move silently.
+            pass
 
 
 def _button_name(button: Qt.MouseButton) -> str:
@@ -178,12 +209,15 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
         self.setWindowOpacity(self._opacity)
+        self.setFocusPolicy(Qt.StrongFocus)
 
     def activate(self) -> None:
         rect = self.monitor.rect()
         self.setGeometry(rect)
         self.show()
         self.grabMouse()
+        self.raise_()
+        self.activateWindow()
 
     def deactivate(self) -> None:
         self.releaseMouse()
@@ -216,6 +250,22 @@ class OverlayWindow(QWidget):
             button=_button_name(event.button()),
         )
 
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.isAutoRepeat():
+            return
+        key_name, modifiers = self._normalize_key(event)
+        if key_name == "esc" and "ctrl" in modifiers:
+            return  # skip hotkey combination
+        self._send_key_event("key_down", key_name, modifiers)
+
+    def keyReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.isAutoRepeat():
+            return
+        key_name, modifiers = self._normalize_key(event)
+        if key_name == "esc" and "ctrl" in modifiers:
+            return
+        self._send_key_event("key_up", key_name, modifiers)
+
     def _send_pointer_event(self, global_pos, action: str, button: Optional[str] = None) -> None:
         geo = self.geometry()
         clamped_x = max(geo.left(), min(global_pos.x(), geo.right()))
@@ -235,7 +285,77 @@ class OverlayWindow(QWidget):
         }
         if button:
             payload["button"] = button
-        asyncio.create_task(self.server.broadcast(json.dumps(payload)))
+        # enqueue to avoid per-event await lag
+        self.server.enqueue(json.dumps(payload))
+
+    def _send_key_event(self, action: str, key: str, modifiers: list[str]) -> None:
+        payload = {
+            "action": action,
+            "key": key,
+            "modifiers": modifiers,
+            "screen": self.monitor.name,
+        }
+        self.server.enqueue(json.dumps(payload))
+
+    def _normalize_key(self, event) -> tuple[str, list[str]]:
+        key_map = {
+            Qt.Key_Shift: "shift",
+            Qt.Key_Control: "ctrl",
+            Qt.Key_Alt: "alt",
+            Qt.Key_Meta: "meta",
+            Qt.Key_Super_L: "meta",
+            Qt.Key_Super_R: "meta",
+            Qt.Key_Tab: "tab",
+            Qt.Key_Backspace: "backspace",
+            Qt.Key_Return: "enter",
+            Qt.Key_Enter: "enter",
+            Qt.Key_Escape: "esc",
+            Qt.Key_Left: "left",
+            Qt.Key_Right: "right",
+            Qt.Key_Up: "up",
+            Qt.Key_Down: "down",
+            Qt.Key_Space: "space",
+            Qt.Key_Home: "home",
+            Qt.Key_End: "end",
+            Qt.Key_PageUp: "pageup",
+            Qt.Key_PageDown: "pagedown",
+            Qt.Key_Delete: "delete",
+            Qt.Key_Insert: "insert",
+            Qt.Key_CapsLock: "capslock",
+            Qt.Key_NumLock: "numlock",
+            Qt.Key_ScrollLock: "scrolllock",
+            Qt.Key_F1: "f1",
+            Qt.Key_F2: "f2",
+            Qt.Key_F3: "f3",
+            Qt.Key_F4: "f4",
+            Qt.Key_F5: "f5",
+            Qt.Key_F6: "f6",
+            Qt.Key_F7: "f7",
+            Qt.Key_F8: "f8",
+            Qt.Key_F9: "f9",
+            Qt.Key_F10: "f10",
+            Qt.Key_F11: "f11",
+            Qt.Key_F12: "f12",
+        }
+        key_val = event.key()
+        text = event.text()
+        key_name = key_map.get(key_val)
+        if not key_name:
+            if text:
+                key_name = text.lower()
+            else:
+                key_name = f"keycode_{int(key_val)}"
+        modifiers = []
+        mods = event.modifiers()
+        if mods & Qt.ShiftModifier:
+            modifiers.append("shift")
+        if mods & Qt.ControlModifier:
+            modifiers.append("ctrl")
+        if mods & Qt.AltModifier:
+            modifiers.append("alt")
+        if mods & Qt.MetaModifier:
+            modifiers.append("meta")
+        return key_name, modifiers
 
 
 class ControlWindow(QWidget):

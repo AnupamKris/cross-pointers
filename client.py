@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Union
 import qasync
 import websockets
 from pynput.mouse import Button, Controller
+from pynput.keyboard import Controller as KeyController, Key
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,10 +42,11 @@ def save_config(data: dict) -> None:
 
 
 class MouseApplier:
-    """Maps normalized coordinates to the local screen and drives the OS cursor."""
+    """Maps normalized coordinates to the local screen and drives the OS cursor + keyboard."""
 
     def __init__(self) -> None:
-        self.controller = Controller()
+        self.mouse = Controller()
+        self.keyboard = KeyController()
 
     def apply_normalized(self, norm_x: float, norm_y: float) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -53,7 +55,7 @@ class MouseApplier:
         geo = screen.geometry()
         x = max(geo.left(), min(geo.right(), int(geo.left() + norm_x * geo.width())))
         y = max(geo.top(), min(geo.bottom(), int(geo.top() + norm_y * geo.height())))
-        self.controller.position = (x, y)
+        self.mouse.position = (x, y)
 
     def click_action(self, action: str, button_name: str) -> None:
         btn = {
@@ -64,9 +66,66 @@ class MouseApplier:
             "x2": Button.x2,
         }.get(button_name, Button.left)
         if action == "down":
-            self.controller.press(btn)
+            self.mouse.press(btn)
         elif action == "up":
-            self.controller.release(btn)
+            self.mouse.release(btn)
+
+    def key_action(self, action: str, key_name: str) -> None:
+        key_obj = self._key_from_name(key_name)
+        if key_obj is None:
+            return
+        try:
+            if action == "key_down":
+                self.keyboard.press(key_obj)
+            elif action == "key_up":
+                self.keyboard.release(key_obj)
+        except Exception:
+            # Ignore platform-specific failures
+            pass
+
+    def _key_from_name(self, name: str):
+        special = {
+            "shift": Key.shift,
+            "ctrl": Key.ctrl,
+            "alt": Key.alt,
+            "meta": Key.cmd,
+            "cmd": Key.cmd,
+            "tab": Key.tab,
+            "backspace": Key.backspace,
+            "enter": Key.enter,
+            "esc": Key.esc,
+            "left": Key.left,
+            "right": Key.right,
+            "up": Key.up,
+            "down": Key.down,
+            "space": Key.space,
+            "home": Key.home,
+            "end": Key.end,
+            "pageup": Key.page_up,
+            "pagedown": Key.page_down,
+            "delete": Key.delete,
+            "insert": Key.insert,
+            "capslock": Key.caps_lock,
+            "numlock": Key.num_lock,
+            "scrolllock": Key.scroll_lock,
+            "f1": Key.f1,
+            "f2": Key.f2,
+            "f3": Key.f3,
+            "f4": Key.f4,
+            "f5": Key.f5,
+            "f6": Key.f6,
+            "f7": Key.f7,
+            "f8": Key.f8,
+            "f9": Key.f9,
+            "f10": Key.f10,
+            "f11": Key.f11,
+            "f12": Key.f12,
+        }
+        if name in special:
+            return special[name]
+        if len(name) == 1:
+            return name
+        return None
 
 
 def parse_payload(payload: Union[bytes, str]) -> Optional[dict]:
@@ -82,14 +141,20 @@ def parse_payload(payload: Union[bytes, str]) -> Optional[dict]:
 
 def _handle_parsed(payload: dict, applier: MouseApplier, status_cb, udp: bool = False) -> None:
     action = payload.get("action", "move")
-    norm_x = float(payload.get("x", 0.0))
-    norm_y = float(payload.get("y", 0.0))
     screen = payload.get("screen", "remote")
-    if action == "move":
-        applier.apply_normalized(norm_x, norm_y)
-    elif action in {"down", "up"}:
-        button = payload.get("button", "left")
-        applier.click_action(action, button)
+    if action in {"move", "down", "up"}:
+        norm_x = float(payload.get("x", 0.0))
+        norm_y = float(payload.get("y", 0.0))
+        if action == "move":
+            applier.apply_normalized(norm_x, norm_y)
+        elif action in {"down", "up"}:
+            button = payload.get("button", "left")
+            applier.click_action(action, button)
+    elif action in {"key_down", "key_up"}:
+        key_name = payload.get("key", "")
+        # Ignore our host hotkey combination (handled host-side already)
+        if not (key_name == "esc" and "ctrl" in payload.get("modifiers", [])):
+            applier.key_action(action, key_name)
     if udp:
         status_cb(f"Controlling from {screen} (UDP)")
 
