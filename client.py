@@ -156,9 +156,18 @@ def _handle_parsed(payload: dict, applier: MouseApplier, status_cb, udp: bool = 
             applier.click_action(action, button)
     elif action in {"key_down", "key_up"}:
         key_name = payload.get("key", "")
+        modifiers = payload.get("modifiers", [])
         # Ignore our host hotkey combination (handled host-side already)
-        if not (key_name == "esc" and "ctrl" in payload.get("modifiers", [])):
+        if key_name == "esc" and "ctrl" in modifiers:
+            return
+        if action == "key_down":
+            for mod in modifiers:
+                applier.key_action("key_down", mod)
             applier.key_action(action, key_name)
+        else:  # key_up
+            applier.key_action(action, key_name)
+            for mod in modifiers:
+                applier.key_action("key_up", mod)
     if udp:
         status_cb(f"Controlling from {screen} (UDP)")
 
