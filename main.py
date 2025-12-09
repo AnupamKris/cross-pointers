@@ -2,12 +2,12 @@ import asyncio
 import json
 import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 import qasync
 import websockets
 from pynput import keyboard
-from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QColor, QCursor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -65,13 +65,21 @@ def list_monitors() -> List[MonitorInfo]:
 
 
 class MouseServer:
-    """WebSocket broadcaster for mouse movement."""
+    """WebSocket broadcaster for mouse movement with UDP fast-path."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8765) -> None:
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+    ) -> None:
+        self.loop = loop
         self._host = host
         self._port = port
         self._clients: set[websockets.WebSocketServerProtocol] = set()
         self._server: Optional[websockets.server.Serve] = None
+        self._udp_clients: Set[Tuple[str, int]] = set()
+        self._udp_transport: Optional[asyncio.DatagramTransport] = None
 
     @property
     def address(self) -> str:
@@ -84,31 +92,54 @@ class MouseServer:
         async def handler(websocket: websockets.WebSocketServerProtocol):
             self._clients.add(websocket)
             try:
-                async for _ in websocket:
-                    pass
+                async for message in websocket:
+                    try:
+                        payload = json.loads(message)
+                    except json.JSONDecodeError:
+                        continue
+                    udp_port = payload.get("udp_port")
+                    if isinstance(udp_port, int):
+                        peer_ip = websocket.remote_address[0] if websocket.remote_address else None
+                        if peer_ip:
+                            self._udp_clients.add((peer_ip, udp_port))
             finally:
                 self._clients.discard(websocket)
 
         self._server = await websockets.serve(handler, self._host, self._port)
+        # UDP transport for faster broadcasting
+        self._udp_transport, _ = await self.loop.create_datagram_endpoint(
+            lambda: asyncio.DatagramProtocol(), local_addr=(self._host, 0)
+        )
 
     async def stop(self) -> None:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        if self._udp_transport:
+            self._udp_transport.close()
         self._server = None
+        self._udp_transport = None
+        self._udp_clients.clear()
         self._clients.clear()
 
     async def broadcast(self, payload: str) -> None:
-        if not self._clients:
-            return
-        stale = []
-        for client in tuple(self._clients):
-            try:
-                await client.send(payload)
-            except Exception:
-                stale.append(client)
-        for client in stale:
-            self._clients.discard(client)
+        if self._clients:
+            stale = []
+            for client in tuple(self._clients):
+                try:
+                    await client.send(payload)
+                except Exception:
+                    stale.append(client)
+            for client in stale:
+                self._clients.discard(client)
+
+        if self._udp_transport and self._udp_clients:
+            data = payload.encode()
+            for addr in tuple(self._udp_clients):
+                try:
+                    self._udp_transport.sendto(data, addr)
+                except Exception:
+                    self._udp_clients.discard(addr)
 
 
 class OverlayWindow(QWidget):
@@ -186,7 +217,7 @@ class ControlWindow(QWidget):
         super().__init__()
         self.loop = loop
         self.monitors = list_monitors()
-        self.server = MouseServer()
+        self.server = MouseServer(loop=self.loop)
         self.overlay: Optional[OverlayWindow] = None
         self.overlay_enabled = False
         self.hotkey = "<ctrl>+<alt>+m"
