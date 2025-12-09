@@ -2,13 +2,14 @@ import asyncio
 import json
 import contextlib
 import sys
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import qasync
 import websockets
 from pynput import keyboard
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QTimer, QRect, Qt
 from PySide6.QtGui import QColor, QCursor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -83,6 +84,13 @@ class MouseServer:
         self._udp_transport: Optional[asyncio.DatagramTransport] = None
         self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
         self._pump_task: Optional[asyncio.Task] = None
+        self._config: Dict[str, object] = {
+            "hot_edge": "none",
+            "hot_velocity": 900,
+            "hot_band": 16,
+        }
+        self._config_listener: Optional[Callable[[dict], None]] = None
+        self._command_listener: Optional[Callable[[str, dict], None]] = None
 
     @property
     def address(self) -> str:
@@ -105,6 +113,19 @@ class MouseServer:
                         peer_ip = websocket.remote_address[0] if websocket.remote_address else None
                         if peer_ip:
                             self._udp_clients.add((peer_ip, udp_port))
+                    msg_type = payload.get("type")
+                    if msg_type == "hello":
+                        config = payload.get("config")
+                        if isinstance(config, dict):
+                            self._update_config(config, source="client", origin=websocket)
+                        await self._send_config_to(websocket)
+                    elif msg_type == "config_update":
+                        config = payload.get("config")
+                        if isinstance(config, dict):
+                            self._update_config(config, source="client", origin=websocket)
+                    elif msg_type == "hot_edge_hit":
+                        if self._command_listener:
+                            self._command_listener("hot_edge_hit", payload)
             finally:
                 self._clients.discard(websocket)
 
@@ -131,10 +152,67 @@ class MouseServer:
                 await self._pump_task
         self._pump_task = None
 
+    def set_config_listener(self, listener: Callable[[dict], None]) -> None:
+        self._config_listener = listener
+
+    def set_command_listener(self, listener: Callable[[str, dict], None]) -> None:
+        self._command_listener = listener
+
+    def set_hot_config(self, config: Dict[str, object]) -> None:
+        self._update_config(config, source="host")
+
+    def _update_config(
+        self,
+        config: Dict[str, object],
+        source: str,
+        origin: Optional[websockets.WebSocketServerProtocol] = None,
+    ) -> None:
+        changed = False
+        for key in ("hot_edge", "hot_velocity", "hot_band"):
+            if key in config and config[key] != self._config.get(key):
+                self._config[key] = config[key]
+                changed = True
+        if not changed:
+            return
+        if self._config_listener:
+            self._config_listener(dict(self._config))
+        self.loop.create_task(self._broadcast_config(origin=origin))
+
+    async def _broadcast_config(
+        self, origin: Optional[websockets.WebSocketServerProtocol] = None
+    ) -> None:
+        if not self._clients:
+            return
+        msg = json.dumps({"type": "config_update", "config": self._config})
+        stale: list[websockets.WebSocketServerProtocol] = []
+        for client in tuple(self._clients):
+            if origin and client == origin:
+                continue
+            try:
+                await client.send(msg)
+            except Exception:
+                stale.append(client)
+        for client in stale:
+            self._clients.discard(client)
+
+    async def _send_config_to(self, websocket: websockets.WebSocketServerProtocol) -> None:
+        try:
+            await websocket.send(json.dumps({"type": "config_update", "config": self._config}))
+        except Exception:
+            self._clients.discard(websocket)
+
     async def _pump(self) -> None:
         while True:
             payload = await self._queue.get()
             try:
+                is_keyboard = False
+                try:
+                    parsed = json.loads(payload)
+                    action = parsed.get("action", "")
+                    is_keyboard = action.startswith("key_")
+                except Exception:
+                    pass
+
                 if self._clients:
                     stale = []
                     for client in tuple(self._clients):
@@ -145,7 +223,7 @@ class MouseServer:
                     for client in stale:
                         self._clients.discard(client)
 
-                if self._udp_transport and self._udp_clients:
+                if self._udp_transport and self._udp_clients and not is_keyboard:
                     data = payload.encode()
                     for addr in tuple(self._udp_clients):
                         try:
@@ -370,8 +448,20 @@ class ControlWindow(QWidget):
         self.overlay_enabled = False
         self.hotkey = "<ctrl>+<esc>"
         self.hotkey_listener: Optional[keyboard.GlobalHotKeys] = None
+        self.hot_edge = "none"
+        self.hot_velocity = 900  # pixels per second
+        self.hot_band = 16
+        self._last_cursor_pos: Optional[Tuple[int, int]] = None
+        self._last_cursor_time: Optional[float] = None
+        self._last_trigger_time: float = 0.0
+        self.cursor_timer = QTimer()
+        self.cursor_timer.setInterval(30)
+        self.cursor_timer.timeout.connect(self._poll_cursor)
+        self.server.set_config_listener(self._on_server_config)
+        self.server.set_command_listener(self._on_server_command)
         self._build_ui()
         self._start_hotkey_listener()
+        self.cursor_timer.start()
 
     def _build_ui(self) -> None:
         self.setWindowTitle("Cross Pointers - Host")
@@ -389,6 +479,24 @@ class ControlWindow(QWidget):
             )
         monitor_row.addWidget(self.monitor_combo)
         layout.addLayout(monitor_row)
+
+        hot_row = QHBoxLayout()
+        hot_row.addWidget(QLabel("Hot edge:"))
+        self.hot_edge_combo = QComboBox()
+        for edge in ["none", "left", "right", "top", "bottom"]:
+            self.hot_edge_combo.addItem(edge)
+        self.hot_edge_combo.setCurrentText(self.hot_edge)
+        self.hot_edge_combo.currentTextChanged.connect(self._on_hot_edge_changed)
+        hot_row.addWidget(self.hot_edge_combo)
+        hot_row.addWidget(QLabel("Min speed:"))
+        self.hot_speed_slider = QSlider(Qt.Horizontal)
+        self.hot_speed_slider.setRange(200, 2000)
+        self.hot_speed_slider.setValue(self.hot_velocity)
+        self.hot_speed_slider.valueChanged.connect(self._on_hot_speed_changed)
+        hot_row.addWidget(self.hot_speed_slider)
+        self.hot_speed_label = QLabel(f"{self.hot_velocity}px/s")
+        hot_row.addWidget(self.hot_speed_label)
+        layout.addLayout(hot_row)
 
         opacity_row = QHBoxLayout()
         opacity_row.addWidget(QLabel("Overlay opacity:"))
@@ -435,6 +543,25 @@ class ControlWindow(QWidget):
         if self.overlay:
             self.overlay.set_overlay_opacity(value / 100)
 
+    def _on_hot_edge_changed(self, value: str) -> None:
+        self.hot_edge = value
+        self._send_config_update()
+
+    def _on_hot_speed_changed(self, value: int) -> None:
+        self.hot_velocity = value
+        self.hot_speed_label.setText(f"{value}px/s")
+        self._send_config_update()
+
+    def _send_config_update(self) -> None:
+        self.server.set_hot_config(self._current_hot_config())
+
+    def _current_hot_config(self) -> dict:
+        return {
+            "hot_edge": self.hot_edge,
+            "hot_velocity": self.hot_velocity,
+            "hot_band": self.hot_band,
+        }
+
     async def toggle_overlay(self) -> None:
         if self.overlay_enabled:
             await self.disable_overlay()
@@ -471,8 +598,72 @@ class ControlWindow(QWidget):
         if self.hotkey_listener:
             self.hotkey_listener.stop()
         asyncio.create_task(self.server.stop())
+        if self.cursor_timer.isActive():
+            self.cursor_timer.stop()
         self.loop.call_soon(self.loop.stop)
         super().closeEvent(event)
+
+    def _on_server_config(self, config: dict) -> None:
+        edge = config.get("hot_edge", self.hot_edge)
+        velocity = int(config.get("hot_velocity", self.hot_velocity))
+        self.hot_band = int(config.get("hot_band", self.hot_band))
+        if edge != self.hot_edge:
+            self.hot_edge = edge
+            self.hot_edge_combo.blockSignals(True)
+            self.hot_edge_combo.setCurrentText(edge)
+            self.hot_edge_combo.blockSignals(False)
+        if velocity != self.hot_velocity:
+            self.hot_velocity = velocity
+            self.hot_speed_slider.blockSignals(True)
+            self.hot_speed_slider.setValue(velocity)
+            self.hot_speed_slider.blockSignals(False)
+            self.hot_speed_label.setText(f"{velocity}px/s")
+
+    def _on_server_command(self, command: str, payload: dict) -> None:
+        if command == "hot_edge_hit" and self.overlay_enabled:
+            asyncio.create_task(self.disable_overlay())
+
+    def _poll_cursor(self) -> None:
+        if self.hot_edge == "none":
+            self._last_cursor_pos = None
+            self._last_cursor_time = None
+            return
+        now = time.monotonic()
+        pos = QCursor.pos()
+        pos_tuple = (pos.x(), pos.y())
+        speed = 0.0
+        if self._last_cursor_pos and self._last_cursor_time:
+            dx = pos_tuple[0] - self._last_cursor_pos[0]
+            dy = pos_tuple[1] - self._last_cursor_pos[1]
+            dt = max(1e-3, now - self._last_cursor_time)
+            speed = (dx * dx + dy * dy) ** 0.5 / dt
+        self._last_cursor_pos = pos_tuple
+        self._last_cursor_time = now
+        if self.overlay_enabled:
+            return
+        if speed < self.hot_velocity:
+            return
+        monitor = self.monitors[self.monitor_combo.currentIndex()]
+        rect = monitor.rect()
+        if self._is_in_hot_zone(pos_tuple, rect):
+            if now - self._last_trigger_time > 0.6:
+                self._last_trigger_time = now
+                asyncio.create_task(self.enable_overlay())
+
+    def _is_in_hot_zone(self, pos: Tuple[int, int], rect: QRect) -> bool:
+        x, y = pos
+        band = self.hot_band
+        if not rect.contains(x, y):
+            return False
+        if self.hot_edge == "left":
+            return x <= rect.left() + band
+        if self.hot_edge == "right":
+            return x >= rect.right() - band
+        if self.hot_edge == "top":
+            return y <= rect.top() + band
+        if self.hot_edge == "bottom":
+            return y >= rect.bottom() - band
+        return False
 
 
 def main() -> None:
