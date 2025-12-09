@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Union
 
 import qasync
 import websockets
-from pynput.mouse import Controller
+from pynput.mouse import Button, Controller
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,7 +41,7 @@ def save_config(data: dict) -> None:
 
 
 class MouseApplier:
-    """Maps normalized coordinates to the local screen and moves the OS cursor."""
+    """Maps normalized coordinates to the local screen and drives the OS cursor."""
 
     def __init__(self) -> None:
         self.controller = Controller()
@@ -55,19 +55,43 @@ class MouseApplier:
         y = max(geo.top(), min(geo.bottom(), int(geo.top() + norm_y * geo.height())))
         self.controller.position = (x, y)
 
+    def click_action(self, action: str, button_name: str) -> None:
+        btn = {
+            "left": Button.left,
+            "right": Button.right,
+            "middle": Button.middle,
+            "x1": Button.x1,
+            "x2": Button.x2,
+        }.get(button_name, Button.left)
+        if action == "down":
+            self.controller.press(btn)
+        elif action == "up":
+            self.controller.release(btn)
 
-def parse_payload(payload: Union[bytes, str]) -> Optional[Tuple[float, float, str]]:
+
+def parse_payload(payload: Union[bytes, str]) -> Optional[dict]:
     try:
         if isinstance(payload, bytes):
             data = json.loads(payload.decode())
         else:
             data = json.loads(payload)
-        norm_x = float(data.get("x", 0.0))
-        norm_y = float(data.get("y", 0.0))
-        screen = data.get("screen", "remote")
-        return norm_x, norm_y, screen
+        return data
     except Exception:
         return None
+
+
+def _handle_parsed(payload: dict, applier: MouseApplier, status_cb, udp: bool = False) -> None:
+    action = payload.get("action", "move")
+    norm_x = float(payload.get("x", 0.0))
+    norm_y = float(payload.get("y", 0.0))
+    screen = payload.get("screen", "remote")
+    if action == "move":
+        applier.apply_normalized(norm_x, norm_y)
+    elif action in {"down", "up"}:
+        button = payload.get("button", "left")
+        applier.click_action(action, button)
+    if udp:
+        status_cb(f"Controlling from {screen} (UDP)")
 
 
 async def udp_consumer(port: int, handler) -> None:
@@ -105,8 +129,7 @@ async def connect_and_control(uri: str, udp_port: int, applier: MouseApplier, st
                 async for message in websocket:
                     parsed = parse_payload(message)
                     if parsed:
-                        norm_x, norm_y, _ = parsed
-                        applier.apply_normalized(norm_x, norm_y)
+                        _handle_parsed(parsed, applier, status_cb)
         except asyncio.CancelledError:
             status_cb("Disconnected (stopped)")
             break
@@ -262,10 +285,7 @@ class ClientWindow(QWidget):
     def _handle_payload(self, payload: bytes, udp: bool = False) -> None:
         parsed = parse_payload(payload)
         if parsed:
-            norm_x, norm_y, screen = parsed
-            self.applier.apply_normalized(norm_x, norm_y)
-            if udp:
-                self.status_label.setText(f"Controlling from {screen} (UDP)")
+            _handle_parsed(parsed, self.applier, self.status_label.setText, udp=udp)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.loop.create_task(self._stop_connection())

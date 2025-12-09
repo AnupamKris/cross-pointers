@@ -142,6 +142,17 @@ class MouseServer:
                     self._udp_clients.discard(addr)
 
 
+def _button_name(button: Qt.MouseButton) -> str:
+    mapping = {
+        Qt.LeftButton: "left",
+        Qt.RightButton: "right",
+        Qt.MiddleButton: "middle",
+        Qt.BackButton: "x1",
+        Qt.ForwardButton: "x2",
+    }
+    return mapping.get(button, "unknown")
+
+
 class OverlayWindow(QWidget):
     """Always-on-top overlay that traps the mouse and streams movement."""
 
@@ -189,25 +200,42 @@ class OverlayWindow(QWidget):
         painter.fillRect(self.rect(), overlay)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        self._send_pointer_event(event.globalPosition().toPoint(), action="move")
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        self._send_pointer_event(
+            event.globalPosition().toPoint(),
+            action="down",
+            button=_button_name(event.button()),
+        )
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        self._send_pointer_event(
+            event.globalPosition().toPoint(),
+            action="up",
+            button=_button_name(event.button()),
+        )
+
+    def _send_pointer_event(self, global_pos, action: str, button: Optional[str] = None) -> None:
         geo = self.geometry()
-        global_pos = event.globalPosition().toPoint()
         clamped_x = max(geo.left(), min(global_pos.x(), geo.right()))
         clamped_y = max(geo.top(), min(global_pos.y(), geo.bottom()))
-        if clamped_x != global_pos.x() or clamped_y != global_pos.y():
+        if action == "move" and (clamped_x != global_pos.x() or clamped_y != global_pos.y()):
             QCursor.setPos(clamped_x, clamped_y)
 
         norm_x = (clamped_x - geo.left()) / geo.width()
         norm_y = (clamped_y - geo.top()) / geo.height()
-        payload = json.dumps(
-            {
-                "x": norm_x,
-                "y": norm_y,
-                "screen": self.monitor.name,
-                "width": geo.width(),
-                "height": geo.height(),
-            }
-        )
-        asyncio.create_task(self.server.broadcast(payload))
+        payload = {
+            "action": action,
+            "x": norm_x,
+            "y": norm_y,
+            "screen": self.monitor.name,
+            "width": geo.width(),
+            "height": geo.height(),
+        }
+        if button:
+            payload["button"] = button
+        asyncio.create_task(self.server.broadcast(json.dumps(payload)))
 
 
 class ControlWindow(QWidget):
@@ -220,7 +248,7 @@ class ControlWindow(QWidget):
         self.server = MouseServer(loop=self.loop)
         self.overlay: Optional[OverlayWindow] = None
         self.overlay_enabled = False
-        self.hotkey = "<ctrl>+<alt>+m"
+        self.hotkey = "<ctrl>+<esc>"
         self.hotkey_listener: Optional[keyboard.GlobalHotKeys] = None
         self._build_ui()
         self._start_hotkey_listener()
