@@ -403,28 +403,29 @@ class OverlayWindow(QWidget):
 
         hit = False
         if self.host_hot_edge == "right" and x >= geo.right() - host_band:
-            x = geo.left() + client_band
             hit = True
         elif self.host_hot_edge == "left" and x <= geo.left() + host_band:
-            x = geo.right() - client_band
             hit = True
         elif self.host_hot_edge == "top" and y <= geo.top() + host_band:
-            y = geo.bottom() - client_band
             hit = True
         elif self.host_hot_edge == "bottom" and y >= geo.bottom() - host_band:
-            y = geo.top() + client_band
             hit = True
 
-        # Align to the client edge direction if it differs (e.g., host right, client bottom)
         if hit:
-            if self.client_hot_edge in {"left", "right"}:
-                x = geo.left() + client_band if self.client_hot_edge == "left" else geo.right() - client_band
-            if self.client_hot_edge in {"top", "bottom"}:
-                y = geo.top() + client_band if self.client_hot_edge == "top" else geo.bottom() - client_band
-            x = max(geo.left(), min(x, geo.right()))
-            y = max(geo.top(), min(y, geo.bottom()))
-            QCursor.setPos(x, y)
-            return QPoint(x, y)
+            target_x = x
+            target_y = y
+            if self.client_hot_edge == "left":
+                target_x = geo.left() + client_band
+            elif self.client_hot_edge == "right":
+                target_x = geo.right() - client_band
+            if self.client_hot_edge == "top":
+                target_y = geo.top() + client_band
+            elif self.client_hot_edge == "bottom":
+                target_y = geo.bottom() - client_band
+            target_x = max(geo.left(), min(target_x, geo.right()))
+            target_y = max(geo.top(), min(target_y, geo.bottom()))
+            QCursor.setPos(target_x, target_y)
+            return QPoint(target_x, target_y)
         return pos
 
     def _send_key_event(self, action: str, key: str, modifiers: list[str]) -> None:
@@ -706,10 +707,25 @@ class ControlWindow(QWidget):
 
     def _on_server_command(self, command: str, payload: dict) -> None:
         if command == "hot_edge_hit" and self.overlay_enabled:
+            # When client signals a return, place the cursor at this host's edge
+            monitor = self.monitors[self.monitor_combo.currentIndex()]
+            rect = monitor.rect()
+            x = rect.center().x()
+            y = rect.center().y()
+            band = max(1, self.host_hot_band)
+            if self.host_hot_edge == "left":
+                x = rect.left() + band
+            elif self.host_hot_edge == "right":
+                x = rect.right() - band
+            elif self.host_hot_edge == "top":
+                y = rect.top() + band
+            elif self.host_hot_edge == "bottom":
+                y = rect.bottom() - band
+            QCursor.setPos(x, y)
             asyncio.create_task(self.disable_overlay())
 
     def _poll_cursor(self) -> None:
-        if self.hot_edge == "none":
+        if self.host_hot_edge == "none":
             self._last_cursor_pos = None
             self._last_cursor_time = None
             return
