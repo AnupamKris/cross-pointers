@@ -203,7 +203,12 @@ async def connect_and_control(
             async with websockets.connect(uri) as websocket:
                 await websocket.send(
                     json.dumps(
-                        {"type": "hello", "udp_port": udp_port, "config": config}
+                        {
+                            "type": "hello",
+                            "udp_port": udp_port,
+                            "config": config,
+                            "role": "client",
+                        }
                     )
                 )
                 status_cb(f"Connected to {uri} (UDP {udp_port})")
@@ -394,7 +399,7 @@ class ClientWindow(QWidget):
 
     def _send_config_update(self) -> None:
         payload = json.dumps(
-            {"type": "config_update", "config": self._current_hot_config()}
+            {"type": "config_update", "config": self._current_hot_config(), "role": "client"}
         )
         try:
             self.outbound_queue.put_nowait(payload)
@@ -468,9 +473,10 @@ class ClientWindow(QWidget):
             _handle_parsed(parsed, self.applier, self.status_label.setText, udp=udp)
 
     def _apply_remote_config(self, config: dict) -> None:
-        edge = config.get("hot_edge", self.hot_edge)
-        velocity = int(config.get("hot_velocity", self.hot_velocity))
-        band = int(config.get("hot_band", self.hot_band))
+        client_cfg = config.get("client", config)
+        edge = client_cfg.get("hot_edge", self.hot_edge)
+        velocity = int(client_cfg.get("hot_velocity", self.hot_velocity))
+        band = int(client_cfg.get("hot_band", self.hot_band))
         changed = False
         if edge != self.hot_edge:
             self.hot_edge = edge
