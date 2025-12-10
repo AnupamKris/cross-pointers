@@ -82,7 +82,7 @@ class MouseServer:
         self._server: Optional[websockets.server.Serve] = None
         self._udp_clients: Set[Tuple[str, int]] = set()
         self._udp_transport: Optional[asyncio.DatagramTransport] = None
-        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1024)
         self._pump_task: Optional[asyncio.Task] = None
         self._config: Dict[str, Dict[str, object]] = {
             "host": {"hot_edge": "none", "hot_velocity": 900, "hot_band": 16},
@@ -512,7 +512,7 @@ class ControlWindow(QWidget):
         self._last_cursor_time: Optional[float] = None
         self._last_trigger_time: float = 0.0
         self.cursor_timer = QTimer()
-        self.cursor_timer.setInterval(30)
+        self.cursor_timer.setInterval(10)
         self.cursor_timer.timeout.connect(self._poll_cursor)
         self.server.set_config_listener(self._on_server_config)
         self.server.set_command_listener(self._on_server_command)
