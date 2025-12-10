@@ -5,6 +5,7 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set, Tuple
+import os
 
 import qasync
 import websockets
@@ -423,6 +424,8 @@ class OverlayWindow(QWidget):
             "modifiers": modifiers,
             "screen": self.monitor.name,
         }
+        if os.environ.get("CP_DEBUG_KEYS") == "1":
+            print(f"[host] key event {action} key={key} mods={modifiers}", flush=True)
         self.server.enqueue(json.dumps(payload))
 
     def _normalize_key(self, event) -> tuple[str, list[str]]:

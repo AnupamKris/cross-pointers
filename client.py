@@ -8,6 +8,8 @@ import contextlib
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
+DEBUG_KEYS = os.environ.get("CP_DEBUG_KEYS") == "1"
+
 import qasync
 from pynput.mouse import Button, Controller
 from pynput.keyboard import Controller as KeyController, Key
@@ -183,6 +185,8 @@ def _handle_parsed(payload: dict, applier: MouseApplier, status_cb, udp: bool = 
                 applier.mods_down.discard(mod)
                 applier.key_action("key_up", mod)
 
+        if DEBUG_KEYS:
+            print(f"[client] key event {action} key={key_name} mods={modifiers} from={screen}", flush=True)
         if action == "key_down":
             for mod in unique_mods:
                 _press_mod(mod)
