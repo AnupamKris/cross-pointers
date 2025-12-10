@@ -8,6 +8,9 @@ import contextlib
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
+from dotenv import load_dotenv
+
+load_dotenv()
 DEBUG_KEYS = os.environ.get("CP_DEBUG_KEYS") == "1"
 
 import qasync
@@ -54,6 +57,7 @@ class MouseApplier:
         self.mouse = Controller()
         self.keyboard = KeyController()
         self.mods_down: set[str] = set()
+        self.chord_mods: dict[str, set[str]] = {}
 
     def apply_normalized(self, norm_x: float, norm_y: float) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -195,11 +199,18 @@ def _handle_parsed(payload: dict, applier: MouseApplier, status_cb, udp: bool = 
                 _press_mod(key_name)
             else:
                 applier.key_action("key_down", key_name)
+                # Remember which mods were attached to this chord so we can release them on key_up
+                if unique_mods:
+                    applier.chord_mods[key_name] = set(unique_mods)
         else:  # key_up
             if key_name in {"ctrl", "shift", "alt", "meta", "cmd"}:
                 _release_mod(key_name)
             else:
                 applier.key_action("key_up", key_name)
+                # If host didn't send modifier key_ups, release chord modifiers now
+                mods_to_release = applier.chord_mods.pop(key_name, set())
+                for mod in mods_to_release:
+                    _release_mod(mod)
     if udp:
         status_cb(f"Controlling from {screen} (UDP)")
 

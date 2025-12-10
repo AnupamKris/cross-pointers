@@ -6,7 +6,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set, Tuple
 import os
+from dotenv import load_dotenv
 
+
+load_dotenv()
 import qasync
 import websockets
 from pynput import keyboard
