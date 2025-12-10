@@ -51,6 +51,7 @@ class MouseApplier:
     def __init__(self) -> None:
         self.mouse = Controller()
         self.keyboard = KeyController()
+        self.mods_down: set[str] = set()
 
     def apply_normalized(self, norm_x: float, norm_y: float) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -171,14 +172,30 @@ def _handle_parsed(payload: dict, applier: MouseApplier, status_cb, udp: bool = 
         if key_name == "esc" and "ctrl" in modifiers:
             return
         unique_mods = [m for m in modifiers if m != key_name]
+        # Ensure modifier state is held across chords; release only on their own key_up.
+        def _press_mod(mod: str) -> None:
+            if mod not in applier.mods_down:
+                applier.mods_down.add(mod)
+                applier.key_action("key_down", mod)
+
+        def _release_mod(mod: str) -> None:
+            if mod in applier.mods_down:
+                applier.mods_down.discard(mod)
+                applier.key_action("key_up", mod)
+
         if action == "key_down":
             for mod in unique_mods:
-                applier.key_action("key_down", mod)
-            applier.key_action(action, key_name)
+                _press_mod(mod)
+            # If this is itself a modifier, track it
+            if key_name in {"ctrl", "shift", "alt", "meta", "cmd"}:
+                _press_mod(key_name)
+            else:
+                applier.key_action("key_down", key_name)
         else:  # key_up
-            applier.key_action(action, key_name)
-            for mod in unique_mods:
-                applier.key_action("key_up", mod)
+            if key_name in {"ctrl", "shift", "alt", "meta", "cmd"}:
+                _release_mod(key_name)
+            else:
+                applier.key_action("key_up", key_name)
     if udp:
         status_cb(f"Controlling from {screen} (UDP)")
 
