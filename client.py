@@ -61,6 +61,12 @@ class MouseApplier:
         y = max(geo.top(), min(geo.bottom(), int(geo.top() + norm_y * geo.height())))
         self.mouse.position = (x, y)
 
+    def scroll_action(self, dx: float, dy: float) -> None:
+        try:
+            self.mouse.scroll(dx, dy)
+        except Exception:
+            pass
+
     def click_action(self, action: str, button_name: str) -> None:
         btn = {
             "left": Button.left,
@@ -154,6 +160,10 @@ def _handle_parsed(payload: dict, applier: MouseApplier, status_cb, udp: bool = 
         elif action in {"down", "up"}:
             button = payload.get("button", "left")
             applier.click_action(action, button)
+    elif action == "scroll":
+        dx = float(payload.get("dx", 0.0))
+        dy = float(payload.get("dy", 0.0))
+        applier.scroll_action(dx, dy)
     elif action in {"key_down", "key_up"}:
         key_name = payload.get("key", "")
         modifiers = payload.get("modifiers", [])

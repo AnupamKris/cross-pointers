@@ -316,6 +316,18 @@ class OverlayWindow(QWidget):
             button=_button_name(event.button()),
         )
 
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        delta = event.angleDelta()
+        dx = delta.x() / 120.0
+        dy = delta.y() / 120.0
+        payload = {
+            "action": "scroll",
+            "dx": dx,
+            "dy": dy,
+            "screen": self.monitor.name,
+        }
+        self.server.enqueue(json.dumps(payload))
+
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if event.isAutoRepeat():
             return
@@ -459,6 +471,10 @@ class OverlayWindow(QWidget):
         if not key_name:
             if text:
                 key_name = text.lower()
+            elif Qt.Key_A <= key_val <= Qt.Key_Z:
+                key_name = chr(ord("a") + (key_val - Qt.Key_A))
+            elif Qt.Key_0 <= key_val <= Qt.Key_9:
+                key_name = chr(ord("0") + (key_val - Qt.Key_0))
             else:
                 key_name = f"keycode_{int(key_val)}"
         modifiers = []
