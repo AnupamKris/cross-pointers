@@ -14,7 +14,7 @@ import qasync
 import websockets
 from pynput import keyboard
 from PySide6.QtCore import QPoint, QTimer, QRect, Qt
-from PySide6.QtGui import QColor, QCursor, QPainter
+from PySide6.QtGui import QColor, QCursor, QPainter, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -94,6 +94,9 @@ class MouseServer:
         }
         self._config_listener: Optional[Callable[[dict], None]] = None
         self._command_listener: Optional[Callable[[str, dict], None]] = None
+        self._clipboard_listener: Optional[
+            Callable[[str, Optional[Tuple[str, int]]], None]
+        ] = None
 
     @property
     def address(self) -> str:
@@ -131,6 +134,12 @@ class MouseServer:
                 elif msg_type == "hot_edge_hit":
                     if self.outer._command_listener:
                         self.outer._command_listener("hot_edge_hit", payload)
+                elif msg_type == "clipboard":
+                    text = payload.get("text")
+                    if isinstance(text, str):
+                        if self.outer._clipboard_listener:
+                            self.outer._clipboard_listener(text, addr)
+                        self.outer.send_clipboard(text, origin=addr)
 
         self._udp_transport, _ = await self.loop.create_datagram_endpoint(
             lambda: UdpProtocol(self), local_addr=(self._host, self._port)
@@ -154,6 +163,11 @@ class MouseServer:
 
     def set_command_listener(self, listener: Callable[[str, dict], None]) -> None:
         self._command_listener = listener
+
+    def set_clipboard_listener(
+        self, listener: Callable[[str, Optional[Tuple[str, int]]], None]
+    ) -> None:
+        self._clipboard_listener = listener
 
     def set_hot_config(self, config: Dict[str, object]) -> None:
         self._update_config(config, role="host")
@@ -233,6 +247,20 @@ class MouseServer:
         except asyncio.QueueFull:
             # If still full, drop the new move silently.
             pass
+
+    def send_clipboard(self, text: str, origin: Optional[Tuple[str, int]] = None) -> None:
+        """Broadcast clipboard contents to connected UDP peers."""
+        if not self._udp_transport or not self._udp_clients:
+            return
+        msg = json.dumps({"type": "clipboard", "text": text})
+        data = msg.encode()
+        for addr in tuple(self._udp_clients):
+            if origin and addr == origin:
+                continue
+            try:
+                self._udp_transport.sendto(data, addr)
+            except Exception:
+                self._udp_clients.discard(addr)
 
 
 def _button_name(button: Qt.MouseButton) -> str:
@@ -336,6 +364,8 @@ class OverlayWindow(QWidget):
         if event.isAutoRepeat():
             return
         key_name, modifiers = self._normalize_key(event)
+        if not key_name:
+            return
         if key_name == "esc" and "ctrl" in modifiers:
             return  # skip hotkey combination
         self._send_key_event("key_down", key_name, modifiers)
@@ -344,6 +374,8 @@ class OverlayWindow(QWidget):
         if event.isAutoRepeat():
             return
         key_name, modifiers = self._normalize_key(event)
+        if not key_name:
+            return
         if key_name == "esc" and "ctrl" in modifiers:
             return
         self._send_key_event("key_up", key_name, modifiers)
@@ -476,12 +508,16 @@ class OverlayWindow(QWidget):
         key_name = key_map.get(key_val)
         if not key_name:
             if text:
-                key_name = text.lower()
-            elif Qt.Key_A <= key_val <= Qt.Key_Z:
+                if len(text) == 1 and 1 <= ord(text) <= 26:
+                    # Ctrl+<letter> produces control codes 1-26
+                    key_name = chr(ord("a") + ord(text) - 1)
+                elif text.isprintable():
+                    key_name = text.lower()
+            if not key_name and Qt.Key_A <= key_val <= Qt.Key_Z:
                 key_name = chr(ord("a") + (key_val - Qt.Key_A))
-            elif Qt.Key_0 <= key_val <= Qt.Key_9:
+            elif not key_name and Qt.Key_0 <= key_val <= Qt.Key_9:
                 key_name = chr(ord("0") + (key_val - Qt.Key_0))
-            else:
+            elif not key_name:
                 key_name = f"keycode_{int(key_val)}"
         modifiers = []
         mods = event.modifiers()
@@ -517,11 +553,15 @@ class ControlWindow(QWidget):
         self._last_cursor_pos: Optional[Tuple[int, int]] = None
         self._last_cursor_time: Optional[float] = None
         self._last_trigger_time: float = 0.0
+        self.clipboard = QGuiApplication.clipboard()
+        self._suppress_clipboard = False
         self.cursor_timer = QTimer()
         self.cursor_timer.setInterval(10)
         self.cursor_timer.timeout.connect(self._poll_cursor)
         self.server.set_config_listener(self._on_server_config)
         self.server.set_command_listener(self._on_server_command)
+        self.server.set_clipboard_listener(self._on_remote_clipboard)
+        self.clipboard.dataChanged.connect(self._on_clipboard_changed)
         self._build_ui()
         self._start_hotkey_listener()
         self.cursor_timer.start()
@@ -624,6 +664,22 @@ class ControlWindow(QWidget):
             "hot_velocity": self.host_hot_velocity,
             "hot_band": self.host_hot_band,
         }
+
+    def _on_clipboard_changed(self) -> None:
+        if self._suppress_clipboard:
+            return
+        text = self.clipboard.text()
+        self.server.send_clipboard(text or "")
+
+    def _on_remote_clipboard(
+        self, text: str, origin: Optional[Tuple[str, int]] = None
+    ) -> None:
+        self._suppress_clipboard = True
+        self.clipboard.setText(text)
+        QTimer.singleShot(150, self._clear_clipboard_suppress)
+
+    def _clear_clipboard_suppress(self) -> None:
+        self._suppress_clipboard = False
 
     async def toggle_overlay(self) -> None:
         if self.overlay_enabled:

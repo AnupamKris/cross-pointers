@@ -278,9 +278,12 @@ class ClientWindow(QWidget):
         self._last_cursor_pos: Optional[Tuple[int, int]] = None
         self._last_cursor_time: Optional[float] = None
         self._last_hit_time: float = 0.0
+        self.clipboard = QGuiApplication.clipboard()
+        self._suppress_clipboard = False
         self.cursor_timer = QTimer()
         self.cursor_timer.setInterval(30)
         self.cursor_timer.timeout.connect(self._poll_cursor)
+        self.clipboard.dataChanged.connect(self._on_clipboard_changed)
         self._build_ui(initial_server, initial_port, initial_udp_port)
         self._update_buttons()
         self.cursor_timer.start()
@@ -414,6 +417,24 @@ class ClientWindow(QWidget):
             pass
         self._save_current_config()
 
+    def _on_clipboard_changed(self) -> None:
+        if self._suppress_clipboard:
+            return
+        text = self.clipboard.text()
+        payload = json.dumps({"type": "clipboard", "text": text or ""})
+        try:
+            self.outbound_queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass
+
+    def _apply_remote_clipboard(self, text: str) -> None:
+        self._suppress_clipboard = True
+        self.clipboard.setText(text)
+        QTimer.singleShot(150, self._clear_clipboard_suppress)
+
+    def _clear_clipboard_suppress(self) -> None:
+        self._suppress_clipboard = False
+
     def _on_connect_clicked(self) -> None:
         if self.connection_task and not self.connection_task.done():
             return
@@ -497,7 +518,13 @@ class ClientWindow(QWidget):
     def _handle_payload(self, payload: bytes, udp: bool = False) -> None:
         parsed = parse_payload(payload)
         if parsed:
-            if parsed.get("type") == "config_update":
+            msg_type = parsed.get("type")
+            if msg_type == "clipboard":
+                text = parsed.get("text", "")
+                if isinstance(text, str):
+                    self._apply_remote_clipboard(text)
+                return
+            if msg_type == "config_update":
                 self._apply_remote_config(parsed.get("config", {}))
                 return
             _handle_parsed(parsed, self.applier, self.status_label.setText, udp=udp)
