@@ -96,54 +96,46 @@ class MouseServer:
         return f"ws://{self._host}:{self._port}"
 
     async def start(self) -> None:
-        if self._server:
+        if self._udp_transport:
             return
 
-        async def handler(websocket: websockets.WebSocketServerProtocol):
-            self._clients.add(websocket)
-            try:
-                async for message in websocket:
-                    try:
-                        payload = json.loads(message)
-                    except json.JSONDecodeError:
-                        continue
-                    udp_port = payload.get("udp_port")
-                    if isinstance(udp_port, int):
-                        peer_ip = websocket.remote_address[0] if websocket.remote_address else None
-                        if peer_ip:
-                            self._udp_clients.add((peer_ip, udp_port))
-                    msg_type = payload.get("type")
-                    if msg_type == "hello":
-                        config = payload.get("config")
-                        role = payload.get("role", "client")
-                        if isinstance(config, dict):
-                            self._update_config(config, role=role, origin=websocket)
-                        await self._send_config_to(websocket)
-                    elif msg_type == "config_update":
-                        config = payload.get("config")
-                        role = payload.get("role", "client")
-                        if isinstance(config, dict):
-                            self._update_config(config, role=role, origin=websocket)
-                    elif msg_type == "hot_edge_hit":
-                        if self._command_listener:
-                            self._command_listener("hot_edge_hit", payload)
-            finally:
-                self._clients.discard(websocket)
+        class UdpProtocol(asyncio.DatagramProtocol):
+            def __init__(self, outer: "MouseServer") -> None:
+                self.outer = outer
 
-        self._server = await websockets.serve(handler, self._host, self._port)
-        # UDP transport for faster broadcasting
+            def datagram_received(self, data: bytes, addr) -> None:
+                try:
+                    payload = json.loads(data.decode())
+                except Exception:
+                    return
+                # Register client for outbound broadcast
+                if isinstance(addr, tuple) and len(addr) >= 2:
+                    self.outer._udp_clients.add((addr[0], addr[1]))
+                msg_type = payload.get("type")
+                if msg_type == "hello":
+                    config = payload.get("config")
+                    role = payload.get("role", "client")
+                    if isinstance(config, dict):
+                        self.outer._update_config(config, role=role, origin=addr)
+                    # send back current config
+                    self.outer._send_config_to_addr(addr)
+                elif msg_type == "config_update":
+                    config = payload.get("config")
+                    role = payload.get("role", "client")
+                    if isinstance(config, dict):
+                        self.outer._update_config(config, role=role, origin=addr)
+                elif msg_type == "hot_edge_hit":
+                    if self.outer._command_listener:
+                        self.outer._command_listener("hot_edge_hit", payload)
+
         self._udp_transport, _ = await self.loop.create_datagram_endpoint(
-            lambda: asyncio.DatagramProtocol(), local_addr=(self._host, 0)
+            lambda: UdpProtocol(self), local_addr=(self._host, self._port)
         )
         self._pump_task = self.loop.create_task(self._pump())
 
     async def stop(self) -> None:
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
         if self._udp_transport:
             self._udp_transport.close()
-        self._server = None
         self._udp_transport = None
         self._udp_clients.clear()
         self._clients.clear()
@@ -183,51 +175,35 @@ class MouseServer:
         self.loop.create_task(self._broadcast_config(origin=origin))
 
     async def _broadcast_config(
-        self, origin: Optional[websockets.WebSocketServerProtocol] = None
+        self, origin: Optional[Tuple[str, int]] = None
     ) -> None:
-        if not self._clients:
+        if not self._udp_transport or not self._udp_clients:
             return
-        msg = json.dumps({"type": "config_update", "config": self._config})
-        stale: list[websockets.WebSocketServerProtocol] = []
-        for client in tuple(self._clients):
-            if origin and client == origin:
+        msg = json.dumps({"type": "config_update", "config": self._config}).encode()
+        for addr in tuple(self._udp_clients):
+            if origin and addr == origin:
                 continue
             try:
-                await client.send(msg)
+                self._udp_transport.sendto(msg, addr)
             except Exception:
-                stale.append(client)
-        for client in stale:
-            self._clients.discard(client)
+                self._udp_clients.discard(addr)
 
-    async def _send_config_to(self, websocket: websockets.WebSocketServerProtocol) -> None:
+    def _send_config_to_addr(self, addr: Tuple[str, int]) -> None:
+        if not self._udp_transport:
+            return
         try:
-            await websocket.send(json.dumps({"type": "config_update", "config": self._config}))
+            self._udp_transport.sendto(
+                json.dumps({"type": "config_update", "config": self._config}).encode(),
+                addr,
+            )
         except Exception:
-            self._clients.discard(websocket)
+            self._udp_clients.discard(addr)
 
     async def _pump(self) -> None:
         while True:
             payload = await self._queue.get()
             try:
-                is_keyboard = False
-                try:
-                    parsed = json.loads(payload)
-                    action = parsed.get("action", "")
-                    is_keyboard = action.startswith("key_")
-                except Exception:
-                    pass
-
-                if self._clients:
-                    stale = []
-                    for client in tuple(self._clients):
-                        try:
-                            await client.send(payload)
-                        except Exception:
-                            stale.append(client)
-                    for client in stale:
-                        self._clients.discard(client)
-
-                if self._udp_transport and self._udp_clients and not is_keyboard:
+                if self._udp_transport and self._udp_clients:
                     data = payload.encode()
                     for addr in tuple(self._udp_clients):
                         try:
@@ -706,8 +682,8 @@ class ControlWindow(QWidget):
             )
 
     def _on_server_command(self, command: str, payload: dict) -> None:
-        if command == "hot_edge_hit" and self.overlay_enabled:
-            # When client signals a return, place the cursor at this host's edge
+        if command == "hot_edge_hit":
+            # Client wants control returned; drop cursor at our configured edge.
             monitor = self.monitors[self.monitor_combo.currentIndex()]
             rect = monitor.rect()
             x = rect.center().x()
@@ -722,7 +698,8 @@ class ControlWindow(QWidget):
             elif self.host_hot_edge == "bottom":
                 y = rect.bottom() - band
             QCursor.setPos(x, y)
-            asyncio.create_task(self.disable_overlay())
+            if self.overlay_enabled:
+                asyncio.create_task(self.disable_overlay())
 
     def _poll_cursor(self) -> None:
         if self.host_hot_edge == "none":

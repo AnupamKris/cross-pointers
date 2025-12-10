@@ -4,11 +4,11 @@ import json
 import os
 import sys
 import time
+import contextlib
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import qasync
-import websockets
 from pynput.mouse import Button, Controller
 from pynput.keyboard import Controller as KeyController, Key
 from PySide6.QtCore import QTimer, Qt
@@ -160,13 +160,14 @@ def _handle_parsed(payload: dict, applier: MouseApplier, status_cb, udp: bool = 
         # Ignore our host hotkey combination (handled host-side already)
         if key_name == "esc" and "ctrl" in modifiers:
             return
+        unique_mods = [m for m in modifiers if m != key_name]
         if action == "key_down":
-            for mod in modifiers:
+            for mod in unique_mods:
                 applier.key_action("key_down", mod)
             applier.key_action(action, key_name)
         else:  # key_up
             applier.key_action(action, key_name)
-            for mod in modifiers:
+            for mod in unique_mods:
                 applier.key_action("key_up", mod)
     if udp:
         status_cb(f"Controlling from {screen} (UDP)")
@@ -196,75 +197,15 @@ async def udp_consumer(port: int, handler) -> None:
         raise
 
 
-async def connect_and_control(
-    uri: str,
-    udp_port: int,
-    applier: MouseApplier,
-    status_cb,
-    config: dict,
-    outbound_queue: Optional[asyncio.Queue[str]] = None,
-    on_config=None,
-) -> None:
-    """WebSocket handshake for registration + fallback data channel."""
-    while True:
+class _ClientUdpProtocol(asyncio.DatagramProtocol):
+    def __init__(self, handler) -> None:
+        self.handler = handler
+
+    def datagram_received(self, data: bytes, addr) -> None:
         try:
-            status_cb(f"Connecting to {uri} ...")
-            async with websockets.connect(uri) as websocket:
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "type": "hello",
-                            "udp_port": udp_port,
-                            "config": config,
-                            "role": "client",
-                        }
-                    )
-                )
-                status_cb(f"Connected to {uri} (UDP {udp_port})")
-                consumer = asyncio.create_task(_ws_consumer(websocket, applier, status_cb, on_config))
-                producer = (
-                    asyncio.create_task(_ws_producer(websocket, outbound_queue))
-                    if outbound_queue is not None
-                    else None
-                )
-                tasks = {consumer}
-                if producer:
-                    tasks.add(producer)
-                done, pending = await asyncio.wait(
-                    tasks, return_when=asyncio.FIRST_EXCEPTION
-                )
-                for task in pending:
-                    task.cancel()
-                for task in done:
-                    task.result()
-        except asyncio.CancelledError:
-            status_cb("Disconnected (stopped)")
-            break
-        except Exception as exc:
-            status_cb(f"Disconnected: {exc}. Reconnecting...")
-            await asyncio.sleep(1.5)
-
-
-async def _ws_consumer(websocket, applier: MouseApplier, status_cb, on_config) -> None:
-    async for message in websocket:
-        parsed = parse_payload(message)
-        if not parsed:
-            continue
-        if parsed.get("type") == "config_update":
-            config = parsed.get("config", {})
-            if on_config:
-                on_config(config)
-            continue
-        _handle_parsed(parsed, applier, status_cb)
-
-
-async def _ws_producer(websocket, queue: asyncio.Queue[str]) -> None:
-    while True:
-        msg = await queue.get()
-        try:
-            await websocket.send(msg)
-        finally:
-            queue.task_done()
+            self.handler(data)
+        except Exception:
+            pass
 
 
 class ClientWindow(QWidget):
@@ -284,6 +225,9 @@ class ClientWindow(QWidget):
         self.loop = loop
         self.connection_task: Optional[asyncio.Task] = None
         self.udp_task: Optional[asyncio.Task] = None
+        self.udp_transport: Optional[asyncio.DatagramTransport] = None
+        self.udp_hello_task: Optional[asyncio.Task] = None
+        self.udp_sender_task: Optional[asyncio.Task] = None
         self.applier = MouseApplier()
         self.hot_edge = initial_hot_edge
         self.hot_velocity = initial_hot_velocity
@@ -372,6 +316,18 @@ class ClientWindow(QWidget):
             return base
         return f"ws://{base}:{port}"
 
+    def _server_host_port(self) -> Tuple[str, int]:
+        base = self.server_input.text().strip()
+        port = self.port_spin.value()
+        if not base:
+            base = "127.0.0.1"
+        if base.startswith(("ws://", "wss://")):
+            base = base.split("://", 1)[1]
+        if ":" in base:
+            host_part = base.split(":", 1)[0]
+            return host_part, port
+        return base, port
+
     def _update_buttons(self) -> None:
         connecting = self.connection_task is not None and not self.connection_task.done()
         self.connect_button.setEnabled(not connecting)
@@ -447,28 +403,48 @@ class ClientWindow(QWidget):
             except asyncio.CancelledError:
                 pass
             self.udp_task = None
+        if self.udp_sender_task:
+            self.udp_sender_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.udp_sender_task
+            self.udp_sender_task = None
+        if self.udp_hello_task:
+            self.udp_hello_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.udp_hello_task
+            self.udp_hello_task = None
+        if self.udp_transport:
+            self.udp_transport.close()
+            self.udp_transport = None
         self.status_label.setText("Disconnected.")
         self._update_buttons()
 
     async def _run_connection(self, url: str, udp_port: int) -> None:
-        # Start UDP listener first for low-latency data
+        # Start UDP listener and sender only
+        host, port = self._server_host_port()
+        loop = asyncio.get_running_loop()
+
         if self.udp_task is None or self.udp_task.done():
-            self.udp_task = self.loop.create_task(
-                udp_consumer(
-                    udp_port, lambda payload: self._handle_payload(payload, udp=True)
-                )
+            def handler(payload: bytes) -> None:
+                self._handle_payload(payload, udp=True)
+
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: _ClientUdpProtocol(handler), local_addr=("0.0.0.0", udp_port)
+            )
+            self.udp_transport = transport
+            self.status_label.setText(f"Connected to udp://{host}:{port} (local {udp_port})")
+
+            self.udp_sender_task = self.loop.create_task(
+                self._udp_sender((host, port))
+            )
+            self.udp_hello_task = self.loop.create_task(
+                self._udp_hello((host, port), udp_port)
             )
 
         try:
-            await connect_and_control(
-                uri=url,
-                udp_port=udp_port,
-                applier=self.applier,
-                status_cb=self.status_label.setText,
-                config=self._current_hot_config(),
-                outbound_queue=self.outbound_queue,
-                on_config=self._apply_remote_config,
-            )
+            # Keep the connection task alive until cancelled
+            while True:
+                await asyncio.sleep(1)
         except asyncio.CancelledError:
             raise
         finally:
@@ -479,6 +455,9 @@ class ClientWindow(QWidget):
     def _handle_payload(self, payload: bytes, udp: bool = False) -> None:
         parsed = parse_payload(payload)
         if parsed:
+            if parsed.get("type") == "config_update":
+                self._apply_remote_config(parsed.get("config", {}))
+                return
             _handle_parsed(parsed, self.applier, self.status_label.setText, udp=udp)
 
     def _apply_remote_config(self, config: dict) -> None:
@@ -549,8 +528,6 @@ class ClientWindow(QWidget):
         return False
 
     def _emit_hot_edge_hit(self) -> None:
-        if self.connection_task is None or self.connection_task.done():
-            return
         payload = json.dumps({"type": "hot_edge_hit", "edge": self.hot_edge})
         try:
             self.outbound_queue.put_nowait(payload)
@@ -562,6 +539,31 @@ class ClientWindow(QWidget):
             self.cursor_timer.stop()
         self.loop.create_task(self._stop_connection())
         super().closeEvent(event)
+
+    async def _udp_sender(self, server_addr: Tuple[str, int]) -> None:
+        """Send outbound messages to host via UDP."""
+        while True:
+            msg = await self.outbound_queue.get()
+            try:
+                if self.udp_transport:
+                    self.udp_transport.sendto(msg.encode(), server_addr)
+            finally:
+                self.outbound_queue.task_done()
+
+    async def _udp_hello(self, server_addr: Tuple[str, int], udp_port: int) -> None:
+        """Periodically announce presence/config to host."""
+        while True:
+            hello = json.dumps(
+                {
+                    "type": "hello",
+                    "role": "client",
+                    "udp_port": udp_port,
+                    "config": self._current_hot_config(),
+                }
+            )
+            if self.udp_transport:
+                self.udp_transport.sendto(hello.encode(), server_addr)
+            await asyncio.sleep(2)
 
 
 def main() -> None:
